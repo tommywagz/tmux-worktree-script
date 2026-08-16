@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+#
+# Usage:
+#   work <session_name> [num_worktrees] [base_branch]
+#   work --clean <session_name> [num_worktrees]
+#
+# Behavior:
+#   - If no worktrees exist yet for this session, creates <num_worktrees> of them.
+#     - Each worktree is created in ../<session_name>-worker-<i>/
+#     - Each worktree is based on <base_branch> (defaults to 'main').
+#   - If worktrees already exist for this session, reuses them as-is
+#     (num_worktrees is ignored in that case).
+#   - If --clean is specified, removes all worktrees and branches for this session.
+#   - If no base_branch is specified, defaults to 'main'.
+#   - If no tmux session exists for this session name, creates one, 
+#   - Splits a session window into one pane per worktree branch. 
+#   - Each pane cd's into its worktree and runs `opencode`.
+#   - If a tmux session already exists, just attaches to it.
+#   - Displays all of the panes in a tiled layout by splitting the window 
+#     vertically and horizontally in an alternating manner to show each worktree branch.
+#
+# Examples:
+#   work agent-squad 3 main
+#   work --clean agent-squad
+
+set -e
+
+# --- Parsing Arguments ---
+CLEAN_MODE=false
+
+if [ "$1" == "--clean" ]; then
+  CLEAN_MODE=true
+  shift
+fi
+
+SESSION_NAME="${1}"
+NUM_WORKTREES="${2:-3}"
+BASE_BRANCH="${3:-main}"
+
+if [ -z "$SESSION_NAME" ]; then
+  echo "Error: Session name required."
+  echo "Usage: work [--clean] <session_name> [num_worktrees] [base_branch]"
+  exit 1
+fi
+
+# Ensure command is run inside a Git repository
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "Error: Must be run inside a Git repository."
+  exit 1
+fi
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# Worktree location structure: <repo_parent>/<session_name>-worker-<i>/
+WORKTREE_PARENT=$(cd "${REPO_ROOT}/.." && pwd)
+BRANCH_PREFIX="agent-${SESSION_NAME}-"
+
+# Every worktree path belonging to this session: the ones git has registered on
+# an agent-<session_name>-<i> branch (so worktrees left over from an older
+# location are still found), plus any directory sitting in the worktree
+# location that git no longer tracks.
+session_worktrees() {
+  {
+    git worktree list --porcelain |
+      awk -v prefix="refs/heads/${BRANCH_PREFIX}" '
+        /^worktree / { path = substr($0, 10) }
+        /^branch /   { if (index(substr($0, 8), prefix) == 1) print path }
+      '
+
+    find "$WORKTREE_PARENT" -maxdepth 1 -type d \
+      -name "${SESSION_NAME}-worker-*" 2>/dev/null
+  } | sort -u -V
+}
+
+# --- CLEANUP MODE ---
+if [ "$CLEAN_MODE" = true ]; then
+  echo "Cleaning up session and worktrees for: '$SESSION_NAME'..."
+
+  # 1. Kill tmux session if running
+  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    echo "  -> Killing tmux session '$SESSION_NAME'..."
+    tmux kill-session -t "$SESSION_NAME"
+  else
+    echo "  -> No active tmux session '$SESSION_NAME' found."
+  fi
+
+  # 2. Force remove this session's worktrees
+  mapfile -t WT_PATHS < <(session_worktrees)
+
+  if [ "${#WT_PATHS[@]}" -gt 0 ]; then
+    for WT_PATH in "${WT_PATHS[@]}"; do
+      echo "  -> Removing worktree: $WT_PATH"
+      git worktree remove --force "$WT_PATH" 2>/dev/null || rm -rf "$WT_PATH"
+
+      # Older layouts nested worktrees below the worktree location; drop the
+      # empty directories they leave behind (a no-op while still in use).
+      WT_PARENT_DIR=$(dirname "$WT_PATH")
+      if [ "$WT_PARENT_DIR" != "$WORKTREE_PARENT" ]; then
+        rmdir -p "$WT_PARENT_DIR" 2>/dev/null || true
+      fi
+    done
+  else
+    echo "  -> No worktrees found for session '$SESSION_NAME'."
+  fi
+
+  # 3. Delete this session's branches
+  mapfile -t BRANCH_NAMES < <(
+    git for-each-ref --format='%(refname:short)' "refs/heads/${BRANCH_PREFIX}*"
+  )
+
+  for BRANCH_NAME in "${BRANCH_NAMES[@]}"; do
+    echo "  -> Deleting branch: $BRANCH_NAME"
+    git branch -D "$BRANCH_NAME" >/dev/null 2>&1 || true
+  done
+
+  # 4. Prune stale git worktree records
+  git worktree prune
+
+  echo "Cleanup complete!"
+  exit 0
+fi
+
+# --- CREATE MODE ---
+
+# If a tmux session already exists for this name, just attach to it.
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  echo "tmux session '$SESSION_NAME' already exists. Attaching..."
+  if [ -z "$TMUX" ]; then
+    tmux attach-session -t "$SESSION_NAME"
+  else
+    tmux switch-client -t "$SESSION_NAME"
+  fi
+  exit 0
+fi
+
+# --- Determine worktrees: reuse existing ones, or create NUM_WORKTREES new ones ---
+mapfile -t WT_PATHS < <(session_worktrees)
+
+if [ "${#WT_PATHS[@]}" -gt 0 ]; then
+  echo "Found ${#WT_PATHS[@]} existing worktree(s) for session '$SESSION_NAME'; reusing them (ignoring num_worktrees)."
+else
+  echo "Creating $NUM_WORKTREES worktrees in: $WORKTREE_PARENT"
+
+  for i in $(seq 1 "$NUM_WORKTREES"); do
+    BRANCH_NAME="${BRANCH_PREFIX}${i}"
+    WT_PATH="${WORKTREE_PARENT}/${SESSION_NAME}-worker-${i}"
+
+    echo "Adding Git worktree: $WT_PATH (Branch: $BRANCH_NAME)"
+    if git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
+      git worktree add "$WT_PATH" "$BRANCH_NAME"
+    else
+      git worktree add -b "$BRANCH_NAME" "$WT_PATH" "$BASE_BRANCH"
+    fi
+
+    WT_PATHS+=("$WT_PATH")
+  done
+fi
+
+NUM_WORKTREES="${#WT_PATHS[@]}"
+WINDOW_NAME="workers"
+
+# Create tmux session with one pane per worktree, each running opencode
+tmux new-session -d -s "$SESSION_NAME" -n "$WINDOW_NAME" -c "${WT_PATHS[0]}"
+
+# Track panes by tmux pane id; ids are stable across splits and re-layouts,
+# unlike positional pane indexes.
+PANE_IDS=("$(tmux list-panes -t "${SESSION_NAME}:${WINDOW_NAME}" -F '#{pane_id}')")
+
+# Split the window vertically and horizontally in an alternating manner so the
+# panes form a tiled grid. Re-tiling after each split keeps every pane big
+# enough for the next split, so many worktrees don't run tmux out of space.
+for ((i = 1; i < NUM_WORKTREES; i++)); do
+  if ((i % 2 == 1)); then
+    SPLIT_AXIS="-h" # side by side
+  else
+    SPLIT_AXIS="-v" # stacked
+  fi
+
+  NEW_PANE=$(tmux split-window "$SPLIT_AXIS" -P -F '#{pane_id}' \
+    -t "${PANE_IDS[i - 1]}" -c "${WT_PATHS[$i]}")
+  PANE_IDS+=("$NEW_PANE")
+
+  tmux select-layout -t "${SESSION_NAME}:${WINDOW_NAME}" tiled >/dev/null
+done
+
+# Start the agents once the layout is settled, so opencode draws at final size
+for ((i = 0; i < NUM_WORKTREES; i++)); do
+  tmux send-keys -t "${PANE_IDS[$i]}" "opencode" C-m
+done
+
+tmux select-pane -t "${PANE_IDS[0]}"
+
+echo "tmux session '$SESSION_NAME' created with $NUM_WORKTREES worktree panes running opencode."
+echo "Attaching..."
+
+# Attach to session if run from standard interactive shell
+if [ -z "$TMUX" ]; then
+  tmux attach-session -t "$SESSION_NAME"
+else
+  tmux switch-client -t "$SESSION_NAME"
+fi
