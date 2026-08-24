@@ -1,45 +1,174 @@
 #!/usr/bin/env bash
 #
 # Usage:
-#   work <session_name> [num_worktrees] [base_branch]
-#   work --clean <session_name> [num_worktrees]
+#   work [--no-root] <session_name> [num_worktrees] [base_branch]
+#   work --clean <session_name>
+#
+# Options:
+#   --no-root   Give every agent its own worktree and leave the repo root alone.
+#               Overrides "worktree": false and the orchestrator default below.
+#
+# Environment:
+#   WORK_DEFAULT_MODEL   Model for any agent that names none (including all of
+#                        the fallback roster). Unset means opencode's own default.
+#   WORK_AUTO_APPROVE    true/1/yes/on adds --auto to the fallback roster's panes.
+#                        Agents from an opencode.json use that file's autoApprove.
 #
 # Behavior:
 #   - If no worktrees exist yet for this session, creates <num_worktrees> of them.
-#     - Each worktree is created in ../<session_name>-worker-<i>/
+#     - Each worktree is created in ../<session_name>-worker-<slug>/
 #     - Each worktree is based on <base_branch> (defaults to 'main').
 #   - If worktrees already exist for this session, reuses them as-is
 #     (num_worktrees is ignored in that case).
 #   - If --clean is specified, removes all worktrees and branches for this session.
 #   - If no base_branch is specified, defaults to 'main'.
-#   - If no tmux session exists for this session name, creates one, 
-#   - Splits a session window into one pane per worktree branch. 
+#   - If no tmux session exists for this session name, creates one,
+#   - Splits a session window into one pane per worktree branch.
 #   - Each pane cd's into its worktree and runs `opencode`.
 #   - If a tmux session already exists, just attaches to it.
-#   - Displays all of the panes in a tiled layout by splitting the window 
+#   - Displays all of the panes in a tiled layout by splitting the window
 #     vertically and horizontally in an alternating manner to show each worktree branch.
+#
+# Where the squad comes from (first match wins):
+#   1. An `opencode.json` with agent entries — see below.
+#   2. Otherwise `.agents/*.md`: each `<name>.md` sitting directly in `.agents/`
+#      becomes agent `<name>`, with that file as its first prompt. Files in
+#      subdirectories (e.g. `.agents/skills/`) are ignored, since those are skill
+#      definitions rather than agent prompts. Model comes from
+#      WORK_DEFAULT_MODEL, autoApprove from WORK_AUTO_APPROVE.
+#   3. Otherwise a lone `orchestrator` in the repo root, plus `num_worktrees`
+#      plain numbered worktrees running bare `opencode`.
+#   In every case an agent named `orchestrator` takes pane 0 in the repo root, so
+#   the first pane is the one that can merge, with or without any configuration.
+#
+# opencode.json workflow (optional):
+#   - On start, looks for an `opencode.json` in the directory the script is run
+#     from (falling back to the repo root). Without that file, the squad is
+#     derived from `.agents/*.md` as described above.
+#   - Each agent entry in it looks like:
+#       "orchestrator": {
+#         "model": "google/gemini-3.5-flash",
+#         "systemPromptFile": ".agents/orchestrator.md",
+#         "autoApprove": true
+#       }
+#     Entries may sit at the top level or under an "agents"/"agent" key.
+#   - Agents are consumed in the order they appear, one per pane:
+#       * <agent_name> names the worktree branch and directory
+#         (agent-<session_name>-<agent_name>)
+#       * the pane's title is set to <agent_name>
+#       * that pane runs `opencode --model <model> --prompt "<systemPromptFile>"`,
+#         so the .md file is the first prompt sent to that agent
+#       * "autoApprove": true adds `--auto` to that pane's opencode command;
+#         false or absent leaves it off. A top-level "autoApprove" sets the
+#         default for every agent that doesn't state its own.
+#   - num_worktrees defaults to the number of agents that need a worktree. Panes
+#     beyond the configured agents fall back to numbered branches and plain
+#     `opencode`.
+#
+# The root agent (orchestrator):
+#   - An agent whose entry sets "worktree": false does NOT get a worktree. It runs
+#     in the repo root itself, on whatever branch is checked out there — normally
+#     <base_branch> / 'main'. That is what an orchestrator needs: it merges worker
+#     branches into main, which is impossible from a worktree on its own branch.
+#   - An agent named "orchestrator" defaults to "worktree": false, so the common
+#     case needs no configuration. Set "worktree": true to override and give it a
+#     worktree like any other agent, or pass --no-root to do that to every agent.
+#   - Root agents always take the FIRST pane(s), whatever order they appear in
+#     opencode.json, so pane 0 is the repo root on main. Worktree agents follow in
+#     config order, then any unconfigured extra worktrees.
+#   - Configuring more than one root agent is allowed but warned about: they would
+#     share one working tree and one branch, and would overwrite each other.
+#   - Total panes = root agents + worktrees, so `num_worktrees` still counts only
+#     the worktrees.
+#
+# Shared job state:
+#   - Git worktrees do not share working files, so agents cannot coordinate
+#     through an ordinary tracked directory: one agent's write is invisible to
+#     the others until it is committed and merged.
+#   - So there is exactly one physical `jobs/` directory, in the repo root, and
+#     every worktree gets a `jobs` symlink pointing at it. Every pane can then
+#     read and write shared state through the plain relative path `jobs/...`.
+#   - The directory (plus `jobs/inbox/` and `jobs/status/`) is created if it does
+#     not exist, and each configured agent gets a skeleton
+#     `jobs/inbox/<agent>.json` and `jobs/status/<agent>.json` if it has none.
+#     Existing files are never overwritten.
+#   - Add `/jobs` to the repo's .gitignore. No trailing slash: in a worktree
+#     `jobs` is a symlink, which git treats as a file, and a `/jobs/`
+#     directory-only pattern would leave it showing up as untracked.
+#   - `--clean` does not touch the shared `jobs/` directory, so a backlog and its
+#     progress survive tearing the session down and bringing it back up.
 #
 # Examples:
 #   work agent-squad 3 main
+#   work agent-squad                  # squad from opencode.json or .agents/*.md
+#   work --no-root agent-squad        # no agent in the repo root
+#   WORK_AUTO_APPROVE=true work agent-squad
 #   work --clean agent-squad
 
 set -e
 
 # --- Parsing Arguments ---
 CLEAN_MODE=false
+NO_ROOT=false
+POSITIONAL=()
 
-if [ "$1" == "--clean" ]; then
-  CLEAN_MODE=true
-  shift
-fi
+# Flags are collected wherever they appear, so `work squad --no-root` and
+# `work --no-root squad` both mean the same thing. Without this, a trailing flag
+# would be read as num_worktrees.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --clean)
+      CLEAN_MODE=true
+      shift
+      ;;
+    --no-root)
+      NO_ROOT=true
+      shift
+      ;;
+    --)
+      # Everything after -- is positional, even if it looks like a flag.
+      shift
+      while [ $# -gt 0 ]; do
+        POSITIONAL+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "Error: unknown option '$1'."
+      echo "Usage: work [--clean] [--no-root] <session_name> [num_worktrees] [base_branch]"
+      exit 1
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
 
 SESSION_NAME="${1}"
 NUM_WORKTREES="${2:-3}"
 BASE_BRANCH="${3:-main}"
 
+# Remember whether the caller pinned a pane count; if not, a configured
+# opencode.json gets to decide it.
+if [ -n "${2:-}" ]; then
+  NUM_WORKTREES_EXPLICIT=true
+
+  # Catch a stray argument here rather than letting it flow into a branch name.
+  if ! [[ "$NUM_WORKTREES" =~ ^[0-9]+$ ]]; then
+    echo "Error: num_worktrees must be a non-negative integer, got '$NUM_WORKTREES'."
+    echo "Usage: work [--clean] [--no-root] <session_name> [num_worktrees] [base_branch]"
+    exit 1
+  fi
+else
+  NUM_WORKTREES_EXPLICIT=false
+fi
+
 if [ -z "$SESSION_NAME" ]; then
   echo "Error: Session name required."
-  echo "Usage: work [--clean] <session_name> [num_worktrees] [base_branch]"
+  echo "Usage: work [--clean] [--no-root] <session_name> [num_worktrees] [base_branch]"
   exit 1
 fi
 
@@ -49,14 +178,15 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 1
 fi
 
+INVOCATION_DIR=$(pwd)
 REPO_ROOT=$(git rev-parse --show-toplevel)
 
-# Worktree location structure: <repo_parent>/<session_name>-worker-<i>/
+# Worktree location structure: <repo_parent>/<session_name>-worker-<slug>/
 WORKTREE_PARENT=$(cd "${REPO_ROOT}/.." && pwd)
 BRANCH_PREFIX="agent-${SESSION_NAME}-"
 
 # Every worktree path belonging to this session: the ones git has registered on
-# an agent-<session_name>-<i> branch (so worktrees left over from an older
+# an agent-<session_name>-<slug> branch (so worktrees left over from an older
 # location are still found), plus any directory sitting in the worktree
 # location that git no longer tracks.
 session_worktrees() {
@@ -70,6 +200,16 @@ session_worktrees() {
     find "$WORKTREE_PARENT" -maxdepth 1 -type d \
       -name "${SESSION_NAME}-worker-*" 2>/dev/null
   } | sort -u -V
+}
+
+in_array() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
 }
 
 # --- CLEANUP MODE ---
@@ -116,6 +256,12 @@ if [ "$CLEAN_MODE" = true ]; then
   # 4. Prune stale git worktree records
   git worktree prune
 
+  # The shared job state deliberately outlives the session: the backlog and the
+  # progress recorded against it are the point of running this at all.
+  if [ -d "${REPO_ROOT}/jobs" ]; then
+    echo "  -> Leaving shared job state in place: ${REPO_ROOT}/jobs"
+  fi
+
   echo "Cleanup complete!"
   exit 0
 fi
@@ -133,6 +279,307 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   exit 0
 fi
 
+# --- opencode.json agent configuration ---
+# Emits one "<name>|<model>|<systemPromptFile>|<autoApprove>|<worktree>" line per
+# agent entry, in the order the entries appear in the file, where | is US (0x1f).
+# The separator has to be non-whitespace: bash collapses runs of whitespace
+# IFS characters, which would swallow the empty fields of a partial entry.
+# autoApprove is normalized to "true"/"false"; an agent that doesn't set it
+# inherits the top-level "autoApprove" (itself defaulting to false).
+# worktree is normalized the same way, but defaults to false for an agent named
+# "orchestrator" (it has to sit on main to merge) and true for everyone else.
+FIELD_SEP=$'\x1f'
+ROOT_AGENT_DEFAULT_NAME="orchestrator"
+
+parse_agent_config() {
+  local config_file="$1"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$config_file" "$ROOT_AGENT_DEFAULT_NAME" <<'PY'
+import json, sys
+
+AGENT_KEYS = ("model", "systemPromptFile", "autoApprove", "worktree")
+
+
+def entries(obj):
+    if not isinstance(obj, dict):
+        return []
+    return [
+        (name, cfg)
+        for name, cfg in obj.items()
+        if isinstance(cfg, dict) and any(key in cfg for key in AGENT_KEYS)
+    ]
+
+
+def truthy(value):
+    # Booleans are the documented form; strings are tolerated so a quoted
+    # "true" in the JSON still does what it looks like it does.
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+try:
+    with open(sys.argv[1]) as handle:
+        config = json.load(handle)
+except Exception as exc:
+    print("could not read config: %s" % exc, file=sys.stderr)
+    sys.exit(1)
+
+# Agents may be nested under "agents"/"agent" or listed at the top level.
+agents = entries(config.get("agents")) + entries(config.get("agent")) or entries(config)
+
+default_auto = truthy(config.get("autoApprove")) if isinstance(config, dict) else False
+root_name = sys.argv[2].strip().lower()
+
+for name, cfg in agents:
+    auto = default_auto if cfg.get("autoApprove") is None else truthy(cfg["autoApprove"])
+    # An orchestrator has to sit in the repo root on main to merge worker
+    # branches, so it opts out of a worktree unless told otherwise.
+    if cfg.get("worktree") is None:
+        worktree = name.strip().lower() != root_name
+    else:
+        worktree = truthy(cfg["worktree"])
+    print("\x1f".join([
+        name,
+        str(cfg.get("model", "")),
+        str(cfg.get("systemPromptFile", "")),
+        "true" if auto else "false",
+        "true" if worktree else "false",
+    ]))
+PY
+  else
+    jq -r --arg root_name "$ROOT_AGENT_DEFAULT_NAME" '
+      def truthy:
+        if type == "boolean" then .
+        elif type == "string" then (ascii_downcase | . == "true" or . == "1" or . == "yes" or . == "on")
+        elif type == "number" then . != 0
+        else false
+        end;
+
+      (.autoApprove | truthy) as $default_auto
+      | ($root_name | ascii_downcase) as $root
+      | (.agents // .agent // .)
+      | to_entries[]
+      | select((.value | type) == "object")
+      | select(.value.model != null or .value.systemPromptFile != null
+               or .value.autoApprove != null or .value.worktree != null)
+      | [
+          .key,
+          (.value.model // ""),
+          (.value.systemPromptFile // ""),
+          (if .value.autoApprove == null then $default_auto else (.value.autoApprove | truthy) end),
+          (if .value.worktree == null
+             then ((.key | ascii_downcase) != $root)
+             else (.value.worktree | truthy) end)
+        ]
+      | map(tostring)
+      | join("\u001f")
+    ' "$config_file"
+  fi
+}
+
+AGENT_NAMES=()
+AGENT_MODELS=()
+AGENT_PROMPTS=()
+AGENT_AUTO_APPROVE=()
+AGENT_WANTS_WORKTREE=()
+
+CONFIG_FILE=""
+for CANDIDATE in "${INVOCATION_DIR}/opencode.json" "${REPO_ROOT}/opencode.json"; do
+  if [ -f "$CANDIDATE" ]; then
+    CONFIG_FILE="$CANDIDATE"
+    break
+  fi
+done
+
+if [ -n "$CONFIG_FILE" ]; then
+  if ! command -v python3 >/dev/null 2>&1 && ! command -v jq >/dev/null 2>&1; then
+    echo "Found $CONFIG_FILE but neither python3 nor jq is available to read it;"
+    echo "  -> falling back to the default roster below."
+    CONFIG_FILE=""
+  fi
+fi
+
+# Registers one agent: validates the name, resolves its prompt file relative to
+# <prompt_base>, and appends it to the AGENT_* arrays. Both the opencode.json path
+# and the no-config fallback go through here so the two cannot drift apart.
+register_agent() {
+  local name="$1"
+  local model="$2"
+  local prompt_rel="$3"
+  local auto="$4"
+  local wants_worktree="$5"
+  local prompt_base="$6"
+
+  # The name becomes a branch, a directory and a pane title, so keep it tame.
+  if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "  -> Skipping agent '$name': name may only contain letters, digits, '.', '_' and '-'."
+    return 0
+  fi
+
+  # An entry that names no model inherits WORK_DEFAULT_MODEL, so a whole squad can
+  # be pointed at one model without editing any config.
+  [ -n "$model" ] || model="${WORK_DEFAULT_MODEL:-}"
+
+  local prompt_path=""
+  if [ -n "$prompt_rel" ]; then
+    case "$prompt_rel" in
+      /*) prompt_path="$prompt_rel" ;;
+      *) prompt_path="${prompt_base}/${prompt_rel}" ;;
+    esac
+
+    if [ ! -f "$prompt_path" ]; then
+      echo "  -> Agent '$name': prompt file '$prompt_path' not found; starting it without a first prompt."
+      prompt_path=""
+    elif [ ! -s "$prompt_path" ]; then
+      echo "  -> Agent '$name': prompt file '$prompt_path' is empty; starting it without a first prompt."
+      prompt_path=""
+    fi
+  fi
+
+  AGENT_NAMES+=("$name")
+  AGENT_MODELS+=("$model")
+  AGENT_PROMPTS+=("$prompt_path")
+
+  if [ "$auto" = "true" ]; then
+    AGENT_AUTO_APPROVE+=("true")
+    echo "  -> Agent '$name': autoApprove is on; its pane runs 'opencode --auto'."
+  else
+    AGENT_AUTO_APPROVE+=("false")
+  fi
+
+  if [ "$wants_worktree" = "false" ]; then
+    AGENT_WANTS_WORKTREE+=("false")
+    echo "  -> Agent '$name': no worktree; it runs in the repo root on the checked-out branch."
+  else
+    AGENT_WANTS_WORKTREE+=("true")
+  fi
+}
+
+if [ -n "$CONFIG_FILE" ]; then
+  echo "Reading agent configuration from: $CONFIG_FILE"
+  CONFIG_DIR=$(cd "$(dirname "$CONFIG_FILE")" && pwd)
+
+  while IFS="$FIELD_SEP" read -r AGENT_NAME AGENT_MODEL PROMPT_REL AUTO_APPROVE WANTS_WORKTREE; do
+    [ -n "$AGENT_NAME" ] || continue
+    register_agent "$AGENT_NAME" "$AGENT_MODEL" "$PROMPT_REL" "$AUTO_APPROVE" \
+      "$WANTS_WORKTREE" "$CONFIG_DIR"
+  done < <(parse_agent_config "$CONFIG_FILE" || true)
+fi
+
+# --- Fallback roster: no opencode.json, or one with no agent entries ---
+# The squad is derived from the instruction files that already exist, so a repo
+# holding .agents/*.md needs no configuration at all: <name>.md becomes agent
+# <name>, with that file as its first prompt. An agent named 'orchestrator' still
+# defaults to the repo root, so pane 0 lands on the base branch either way.
+if [ "${#AGENT_NAMES[@]}" -eq 0 ]; then
+  if [ -n "$CONFIG_FILE" ]; then
+    echo "No agent entries found in $CONFIG_FILE; using built-in defaults."
+  fi
+
+  # Nothing to inherit an autoApprove default from, so it is off unless the
+  # environment asks for it.
+  FALLBACK_AUTO=false
+  case "$(printf '%s' "${WORK_AUTO_APPROVE:-}" | tr '[:upper:]' '[:lower:]')" in
+    true | 1 | yes | on) FALLBACK_AUTO=true ;;
+  esac
+
+  AGENTS_DIR=""
+  for CANDIDATE in "${INVOCATION_DIR}/.agents" "${REPO_ROOT}/.agents"; do
+    if [ -d "$CANDIDATE" ]; then
+      AGENTS_DIR=$(cd "$CANDIDATE" && pwd)
+      break
+    fi
+  done
+
+  # Only .md files sitting directly in .agents/ are agent prompts; a
+  # subdirectory like .agents/skills/ holds skill definitions, not agents.
+  if [ -n "$AGENTS_DIR" ] && compgen -G "${AGENTS_DIR}/*.md" >/dev/null 2>&1; then
+    echo "No agent configuration; deriving the squad from ${AGENTS_DIR}/*.md"
+
+    for PROMPT_FILE in "$AGENTS_DIR"/*.md; do
+      [ -f "$PROMPT_FILE" ] || continue
+
+      FALLBACK_NAME=$(basename "$PROMPT_FILE" .md)
+      FALLBACK_WORKTREE=true
+      if [ "$(printf '%s' "$FALLBACK_NAME" | tr '[:upper:]' '[:lower:]')" = "$ROOT_AGENT_DEFAULT_NAME" ]; then
+        FALLBACK_WORKTREE=false
+      fi
+
+      register_agent "$FALLBACK_NAME" "" "$PROMPT_FILE" "$FALLBACK_AUTO" \
+        "$FALLBACK_WORKTREE" "$AGENTS_DIR"
+    done
+  fi
+
+  # Still nothing: no config and no prompt files. Add just the orchestrator, so
+  # pane 0 is still the repo root on the base branch, and leave the remaining
+  # panes as plain numbered worktrees running bare 'opencode'.
+  if [ "${#AGENT_NAMES[@]}" -eq 0 ] && [ "$NO_ROOT" = false ]; then
+    echo "No agent configuration and no .agents/*.md found."
+    echo "  -> Defaulting pane 0 to '$ROOT_AGENT_DEFAULT_NAME' in the repo root; the rest are plain worktrees."
+    register_agent "$ROOT_AGENT_DEFAULT_NAME" "" "" "$FALLBACK_AUTO" false ""
+  fi
+fi
+
+NUM_AGENTS="${#AGENT_NAMES[@]}"
+
+# Split the agents into the ones that live in the repo root (an orchestrator,
+# which has to be on main to merge worker branches) and the ones that get their
+# own worktree. Root agents take the first panes regardless of config order.
+ROOT_AGENTS=()
+WORKTREE_AGENTS=()
+for ((i = 0; i < NUM_AGENTS; i++)); do
+  # --no-root overrides everything: every agent gets its own worktree and the
+  # repo root is left alone.
+  if [ "$NO_ROOT" = false ] && [ "${AGENT_WANTS_WORKTREE[$i]}" = "false" ]; then
+    ROOT_AGENTS+=("$i")
+  else
+    WORKTREE_AGENTS+=("$i")
+  fi
+done
+NUM_ROOT_AGENTS="${#ROOT_AGENTS[@]}"
+NUM_WORKTREE_AGENTS="${#WORKTREE_AGENTS[@]}"
+
+if [ "$NUM_AGENTS" -gt 0 ]; then
+  echo "Configured agents (in order): ${AGENT_NAMES[*]}"
+
+  if [ "$NO_ROOT" = true ]; then
+    echo "  -> --no-root: nothing runs in the repo root; every agent gets a worktree."
+  fi
+
+  if [ "$NUM_ROOT_AGENTS" -gt 1 ]; then
+    echo "  -> WARNING: $NUM_ROOT_AGENTS agents are configured without a worktree."
+    echo "     They will all share the repo root and the same branch, and will"
+    echo "     overwrite each other's edits. Give all but one a worktree."
+  fi
+
+  if [ "$NUM_ROOT_AGENTS" -eq 0 ] && [ "$NO_ROOT" = false ]; then
+    echo "  -> Note: no agent runs in the repo root, so pane 0 is a worktree. Name an"
+    echo "     agent '$ROOT_AGENT_DEFAULT_NAME', or set \"worktree\": false on one, to"
+    echo "     put it on '$BASE_BRANCH' where it can merge the others' branches."
+  fi
+
+  # num_worktrees counts worktrees, not panes: a root agent needs neither. Guard
+  # against zeroing it out when the only agent is a root agent — the numbered
+  # worktree default still applies to the remaining panes in that case.
+  if [ "$NUM_WORKTREES_EXPLICIT" = false ] && [ "$NUM_WORKTREE_AGENTS" -gt 0 ]; then
+    NUM_WORKTREES="$NUM_WORKTREE_AGENTS"
+  fi
+fi
+
+# Worktree <-> agent naming: the Nth worktree belongs to the Nth agent that asked
+# for one, and any extra worktree falls back to its 1-based position (the
+# pre-config behavior).
+worktree_slug() {
+  local index="$1"
+  if [ "$index" -lt "$NUM_WORKTREE_AGENTS" ]; then
+    printf '%s' "${AGENT_NAMES[${WORKTREE_AGENTS[$index]}]}"
+  else
+    printf '%s' "$((index + 1))"
+  fi
+}
+
 # --- Determine worktrees: reuse existing ones, or create NUM_WORKTREES new ones ---
 mapfile -t WT_PATHS < <(session_worktrees)
 
@@ -141,9 +588,14 @@ if [ "${#WT_PATHS[@]}" -gt 0 ]; then
 else
   echo "Creating $NUM_WORKTREES worktrees in: $WORKTREE_PARENT"
 
-  for i in $(seq 1 "$NUM_WORKTREES"); do
-    BRANCH_NAME="${BRANCH_PREFIX}${i}"
-    WT_PATH="${WORKTREE_PARENT}/${SESSION_NAME}-worker-${i}"
+  if [ "$NUM_WORKTREE_AGENTS" -gt "$NUM_WORKTREES" ]; then
+    echo "  -> Note: $NUM_WORKTREE_AGENTS agents want a worktree but only $NUM_WORKTREES requested; the extra agents are skipped."
+  fi
+
+  for ((i = 0; i < NUM_WORKTREES; i++)); do
+    SLUG=$(worktree_slug "$i")
+    BRANCH_NAME="${BRANCH_PREFIX}${SLUG}"
+    WT_PATH="${WORKTREE_PARENT}/${SESSION_NAME}-worker-${SLUG}"
 
     echo "Adding Git worktree: $WT_PATH (Branch: $BRANCH_NAME)"
     if git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
@@ -156,11 +608,171 @@ else
   done
 fi
 
+# --- Panes ---
+# Identity is assigned explicitly here rather than being re-derived from each
+# directory's name later: a root agent's directory is the repo itself, whose name
+# has nothing to do with the agent. PANE_AGENTS holds an index into AGENT_NAMES,
+# or -1 for a worktree no configured agent claimed.
+PANE_PATHS=()
+PANE_AGENTS=()
+
+# Root agents first, so pane 0 is the repo root on the base branch.
+for AGENT_INDEX in ${ROOT_AGENTS[@]+"${ROOT_AGENTS[@]}"}; do
+  PANE_PATHS+=("$REPO_ROOT")
+  PANE_AGENTS+=("$AGENT_INDEX")
+done
+
+# Then one pane per worktree agent, in config order.
+for AGENT_INDEX in ${WORKTREE_AGENTS[@]+"${WORKTREE_AGENTS[@]}"}; do
+  WANTED="${SESSION_NAME}-worker-${AGENT_NAMES[$AGENT_INDEX]}"
+  for WT_PATH in "${WT_PATHS[@]}"; do
+    if [ "$(basename "$WT_PATH")" = "$WANTED" ]; then
+      PANE_PATHS+=("$WT_PATH")
+      PANE_AGENTS+=("$AGENT_INDEX")
+    fi
+  done
+done
+
+# Then any worktree no agent claimed, running plain 'opencode'.
+for WT_PATH in "${WT_PATHS[@]}"; do
+  in_array "$WT_PATH" ${PANE_PATHS[@]+"${PANE_PATHS[@]}"} && continue
+
+  # A worktree named after a root agent is left over from before that agent moved
+  # into the repo root. Giving it a pane would run a second copy of the agent on
+  # a stale branch, so skip it and say so.
+  STALE_ROOT=false
+  for AGENT_INDEX in ${ROOT_AGENTS[@]+"${ROOT_AGENTS[@]}"}; do
+    if [ "$(basename "$WT_PATH")" = "${SESSION_NAME}-worker-${AGENT_NAMES[$AGENT_INDEX]}" ]; then
+      echo "  -> Skipping stale worktree $(basename "$WT_PATH"): '${AGENT_NAMES[$AGENT_INDEX]}'"
+      echo "     now runs in the repo root. Remove it with:"
+      echo "       git worktree remove --force $WT_PATH"
+      STALE_ROOT=true
+      break
+    fi
+  done
+  [ "$STALE_ROOT" = true ] && continue
+
+  PANE_PATHS+=("$WT_PATH")
+  PANE_AGENTS+=("-1")
+done
+
 NUM_WORKTREES="${#WT_PATHS[@]}"
+NUM_PANES="${#PANE_PATHS[@]}"
+
+if [ "$NUM_PANES" -eq 0 ]; then
+  echo "Error: nothing to run — no worktrees and no root agents."
+  exit 1
+fi
+
+# The root agent merges worker branches, so flag anything that would stop it.
+if [ "$NUM_ROOT_AGENTS" -gt 0 ]; then
+  ROOT_BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+  echo "Root pane: $REPO_ROOT (branch '$ROOT_BRANCH')"
+
+  if [ "$ROOT_BRANCH" != "$BASE_BRANCH" ]; then
+    echo "  -> WARNING: the repo root is on '$ROOT_BRANCH', not '$BASE_BRANCH'. The"
+    echo "     orchestrator merges into whatever is checked out here, so its work"
+    echo "     will land on '$ROOT_BRANCH'. Check out '$BASE_BRANCH' first if that"
+    echo "     is not what you want."
+  fi
+
+  if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
+    echo "  -> WARNING: the repo root has uncommitted changes. An orchestrator that"
+    echo "     merges worker branches needs a clean tree, and worktrees are created"
+    echo "     from the last commit on '$BASE_BRANCH' — uncommitted work will not be"
+    echo "     visible to the workers. Commit before relying on it."
+  fi
+fi
+
+# --- Shared job state ---
+# One physical jobs/ directory, symlinked into every worktree, so all panes
+# coordinate through the same files instead of through commits and merges.
+SHARED_JOBS_DIR="${REPO_ROOT}/jobs"
+
+if [ ! -d "$SHARED_JOBS_DIR" ]; then
+  echo "Creating shared job directory: $SHARED_JOBS_DIR"
+fi
+mkdir -p "${SHARED_JOBS_DIR}/inbox" "${SHARED_JOBS_DIR}/status"
+
+# Only ever seeds a file that does not exist; live state is never overwritten.
+seed_json_if_missing() {
+  local path="$1"
+  local body="$2"
+
+  if [ ! -f "$path" ]; then
+    printf '%s\n' "$body" >"$path"
+    echo "  -> Seeded $(basename "$(dirname "$path")")/$(basename "$path")"
+  fi
+}
+
+# The backlog is gitignored along with the rest of jobs/, so a fresh clone has
+# none. Seed an empty one rather than letting an orchestrator trip over a missing
+# file; it is told to populate the backlog from README.md when it finds it bare.
+seed_json_if_missing "${SHARED_JOBS_DIR}/backlog.json" \
+  "{\"schema_version\":1,\"owner\":\"orchestrator\",\"note\":\"Seeded empty by the work script. Populate from the skill descriptions in README.md.\",\"updated_at\":null,\"stages\":[\"PENDING\",\"FINDING\",\"CREATING\",\"EVALUATING\",\"MERGED\",\"COMPLETED\",\"REQUIRES_HUMAN_REVIEW\"],\"tasks\":[]}"
+
+for AGENT_NAME in "${AGENT_NAMES[@]:-}"; do
+  [ -n "$AGENT_NAME" ] || continue
+
+  seed_json_if_missing "${SHARED_JOBS_DIR}/inbox/${AGENT_NAME}.json" \
+    "{\"schema_version\":1,\"_hint\":\"Written by the orchestrator ONLY. Read it; report back in jobs/status/${AGENT_NAME}.json.\",\"owner\":\"orchestrator\",\"agent\":\"${AGENT_NAME}\",\"state\":\"IDLE\",\"state_values\":[\"IDLE\",\"DISPATCHED\",\"REWORK\",\"STAND_DOWN\"],\"dispatched_at\":null,\"attempt\":0,\"task\":null,\"todo\":[],\"feedback\":[]}"
+
+  seed_json_if_missing "${SHARED_JOBS_DIR}/status/${AGENT_NAME}.json" \
+    "{\"schema_version\":1,\"_hint\":\"Written by ${AGENT_NAME} ONLY. Overwrite it freely; everyone else reads it.\",\"owner\":\"${AGENT_NAME}\",\"agent\":\"${AGENT_NAME}\",\"branch\":null,\"worktree\":null,\"state\":\"BOOTING\",\"state_values\":[\"BOOTING\",\"WAITING\",\"WORKING\",\"BLOCKED\",\"COMPLETED\",\"FAILED\"],\"task_id\":null,\"step\":null,\"updated_at\":null,\"todo\":[],\"artifacts\":[],\"commits\":[],\"blocked_on\":null,\"message\":\"\"}"
+done
+
+# Point each worktree's jobs/ at the shared directory. An absolute target keeps
+# this correct for worktrees that are not siblings of the repo (older layouts
+# nested them), and matches how git records worktree paths anyway.
+for WT_PATH in "${WT_PATHS[@]}"; do
+  # The repo root holds the real directory, not a link to itself. A root agent
+  # already reads and writes the genuine article.
+  [ "$WT_PATH" = "$REPO_ROOT" ] && continue
+
+  JOBS_LINK="${WT_PATH}/jobs"
+
+  if [ -L "$JOBS_LINK" ]; then
+    # -n so an existing symlink-to-directory is replaced rather than being
+    # followed, which would bury the new link at jobs/jobs.
+    if [ "$(readlink "$JOBS_LINK")" != "$SHARED_JOBS_DIR" ]; then
+      ln -sfn "$SHARED_JOBS_DIR" "$JOBS_LINK"
+      echo "  -> Repointed $(basename "$WT_PATH")/jobs at $SHARED_JOBS_DIR"
+    fi
+  elif [ -e "$JOBS_LINK" ]; then
+    # A real file or directory here is somebody's work, not ours to delete.
+    echo "  -> WARNING: $(basename "$WT_PATH")/jobs exists and is not a symlink;"
+    echo "     leaving it alone. That pane will NOT see shared job state."
+  else
+    ln -s "$SHARED_JOBS_DIR" "$JOBS_LINK"
+  fi
+done
+
+echo "Shared job state: $SHARED_JOBS_DIR (symlinked as 'jobs' in each worktree)"
+
+# The symlink only stays invisible to git if the branch the worktrees were made
+# from ignores it. Checking the worktree itself tests what git will actually do,
+# rather than second-guessing the .gitignore contents.
+for WT_PATH in "${WT_PATHS[@]}"; do
+  [ "$WT_PATH" = "$REPO_ROOT" ] && continue
+  [ -e "${WT_PATH}/jobs" ] || continue
+
+  if ! git -C "$WT_PATH" check-ignore -q jobs 2>/dev/null; then
+    echo "  -> WARNING: 'jobs' is not gitignored on branch '$BASE_BRANCH', so it shows"
+    echo "     up as untracked in every worktree and agents may commit shared state."
+    echo "     Add '/jobs' (no trailing slash — in a worktree it is a symlink, which"
+    echo "     git treats as a file) to .gitignore and commit it to '$BASE_BRANCH'."
+  fi
+  break
+done
+
 WINDOW_NAME="workers"
 
-# Create tmux session with one pane per worktree, each running opencode
-tmux new-session -d -s "$SESSION_NAME" -n "$WINDOW_NAME" -c "${WT_PATHS[0]}"
+# Create tmux session with one pane per agent, each running opencode
+tmux new-session -d -s "$SESSION_NAME" -n "$WINDOW_NAME" -c "${PANE_PATHS[0]}"
+
+# Show the pane titles, so each agent's pane is identifiable at a glance.
+tmux set-option -w -t "${SESSION_NAME}:${WINDOW_NAME}" pane-border-status top
+tmux set-option -w -t "${SESSION_NAME}:${WINDOW_NAME}" pane-border-format ' #{pane_title} '
 
 # Track panes by tmux pane id; ids are stable across splits and re-layouts,
 # unlike positional pane indexes.
@@ -169,7 +781,7 @@ PANE_IDS=("$(tmux list-panes -t "${SESSION_NAME}:${WINDOW_NAME}" -F '#{pane_id}'
 # Split the window vertically and horizontally in an alternating manner so the
 # panes form a tiled grid. Re-tiling after each split keeps every pane big
 # enough for the next split, so many worktrees don't run tmux out of space.
-for ((i = 1; i < NUM_WORKTREES; i++)); do
+for ((i = 1; i < NUM_PANES; i++)); do
   if ((i % 2 == 1)); then
     SPLIT_AXIS="-h" # side by side
   else
@@ -177,20 +789,48 @@ for ((i = 1; i < NUM_WORKTREES; i++)); do
   fi
 
   NEW_PANE=$(tmux split-window "$SPLIT_AXIS" -P -F '#{pane_id}' \
-    -t "${PANE_IDS[i - 1]}" -c "${WT_PATHS[$i]}")
+    -t "${PANE_IDS[i - 1]}" -c "${PANE_PATHS[$i]}")
   PANE_IDS+=("$NEW_PANE")
 
   tmux select-layout -t "${SESSION_NAME}:${WINDOW_NAME}" tiled >/dev/null
 done
 
 # Start the agents once the layout is settled, so opencode draws at final size
-for ((i = 0; i < NUM_WORKTREES; i++)); do
-  tmux send-keys -t "${PANE_IDS[$i]}" "opencode" C-m
+for ((i = 0; i < NUM_PANES; i++)); do
+  AGENT_INDEX="${PANE_AGENTS[$i]}"
+  PANE_TITLE=$(basename "${PANE_PATHS[$i]}")
+  OPENCODE_CMD="opencode"
+
+  if [ "$AGENT_INDEX" -ge 0 ]; then
+    PANE_TITLE="${AGENT_NAMES[$AGENT_INDEX]}"
+
+    if [ -n "${AGENT_MODELS[$AGENT_INDEX]}" ]; then
+      OPENCODE_CMD+=" --model $(printf '%q' "${AGENT_MODELS[$AGENT_INDEX]}")"
+    fi
+
+    # Only the agents whose opencode.json entry sets "autoApprove": true skip
+    # the permission prompts.
+    if [ "${AGENT_AUTO_APPROVE[$AGENT_INDEX]}" = "true" ]; then
+      OPENCODE_CMD+=" --auto"
+    fi
+
+    # The prompt file lives next to opencode.json rather than inside the
+    # worktree, so the pane reads it from there at launch time.
+    if [ -n "${AGENT_PROMPTS[$AGENT_INDEX]}" ]; then
+      OPENCODE_CMD+=" --prompt \"\$(cat $(printf '%q' "${AGENT_PROMPTS[$AGENT_INDEX]}"))\""
+    fi
+  fi
+
+  tmux select-pane -t "${PANE_IDS[$i]}" -T "$PANE_TITLE"
+  # opencode retitles its own pane, so pin the border label per pane as well.
+  tmux set-option -p -t "${PANE_IDS[$i]}" pane-border-format " ${PANE_TITLE} "
+  tmux send-keys -t "${PANE_IDS[$i]}" "$OPENCODE_CMD" C-m
 done
 
 tmux select-pane -t "${PANE_IDS[0]}"
 
-echo "tmux session '$SESSION_NAME' created with $NUM_WORKTREES worktree panes running opencode."
+echo "tmux session '$SESSION_NAME' created with $NUM_PANES panes running opencode"
+echo "($NUM_ROOT_AGENTS in the repo root, $NUM_WORKTREES in worktrees)."
 echo "Attaching..."
 
 # Attach to session if run from standard interactive shell
