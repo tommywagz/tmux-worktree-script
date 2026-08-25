@@ -25,7 +25,11 @@
 #   - If no tmux session exists for this session name, creates one,
 #   - Splits a session window into one pane per worktree branch.
 #   - Each pane cd's into its worktree and runs `opencode`.
-#   - If a tmux session already exists, just attaches to it.
+#   - If a tmux session already exists, attaches to it after any required Vertex
+#     authentication preflight.
+#   - If the selected opencode.json configures a native Google Vertex provider,
+#     completes `gcloud auth application-default login` before it creates or
+#     attaches to the tmux session.
 #   - Displays all of the panes in a tiled layout by splitting the window
 #     vertically and horizontally in an alternating manner to show each worktree branch.
 #
@@ -212,6 +216,82 @@ in_array() {
   return 1
 }
 
+# Emits the first native Google Vertex provider as
+# "<provider-id><US><project><US><location>". OpenCode v1 calls the runtime field
+# "npm" and its settings object "options"; v2 calls them "package" and
+# "settings". The provider class, not the user-chosen provider ID, identifies a
+# Vertex provider.
+vertex_provider_config() {
+  local config_file="$1"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$config_file" <<'PY'
+import json
+import sys
+
+VERTEX_PACKAGES = (
+    "@ai-sdk/google-vertex",
+    "@opencode-ai/ai/providers/google-vertex",
+)
+FIELD_SEP = "\x1f"
+
+try:
+    with open(sys.argv[1]) as handle:
+        config = json.load(handle)
+except Exception:
+    sys.exit(2)
+
+for key in ("provider", "providers"):
+    providers = config.get(key, {}) if isinstance(config, dict) else {}
+    if not isinstance(providers, dict):
+        continue
+    for provider_id, provider in providers.items():
+        if not isinstance(provider, dict):
+            continue
+        runtime = provider.get("npm") or provider.get("package", "")
+        if not isinstance(runtime, str):
+            continue
+        runtime = runtime.strip()
+        if any(runtime == package or runtime.startswith(package + "/")
+               for package in VERTEX_PACKAGES):
+            settings = provider.get("options") or provider.get("settings") or {}
+            if not isinstance(settings, dict):
+                settings = {}
+            project = settings.get("project") or settings.get("projectId") or ""
+            location = settings.get("location") or settings.get("region") or ""
+            print(FIELD_SEP.join(map(str, (provider_id, project, location))))
+            sys.exit(0)
+
+sys.exit(1)
+PY
+  elif command -v jq >/dev/null 2>&1; then
+    jq -er '
+      def vertex_runtime:
+        (.npm? // .package? // "") as $runtime
+        | $runtime == "@ai-sdk/google-vertex"
+          or ($runtime | startswith("@ai-sdk/google-vertex/"))
+          or $runtime == "@opencode-ai/ai/providers/google-vertex"
+          or ($runtime | startswith("@opencode-ai/ai/providers/google-vertex/"));
+
+      first(
+        (.provider?, .providers?)
+        | objects
+        | to_entries[]?
+        | select(.value | objects | vertex_runtime)
+        | [
+            .key,
+            (.value.options? // .value.settings? // {} | .project? // .projectId? // ""),
+            (.value.options? // .value.settings? // {} | .location? // .region? // "")
+          ]
+        | map(tostring)
+        | join("\u001f")
+      )
+    ' "$config_file"
+  else
+    return 2
+  fi
+}
+
 # --- CLEANUP MODE ---
 if [ "$CLEAN_MODE" = true ]; then
   echo "Cleaning up session and worktrees for: '$SESSION_NAME'..."
@@ -267,6 +347,70 @@ if [ "$CLEAN_MODE" = true ]; then
 fi
 
 # --- CREATE MODE ---
+
+# Use the same project-level config that supplies the agent roster. The
+# invocation directory wins so a caller can intentionally launch from a nested
+# project; otherwise the repository-root config is used.
+CONFIG_FILE=""
+for CANDIDATE in "${INVOCATION_DIR}/opencode.json" "${REPO_ROOT}/opencode.json"; do
+  if [ -f "$CANDIDATE" ]; then
+    CONFIG_FILE="$CANDIDATE"
+    break
+  fi
+done
+
+if [ -n "$CONFIG_FILE" ]; then
+  if ! command -v python3 >/dev/null 2>&1 && ! command -v jq >/dev/null 2>&1; then
+    echo "Found $CONFIG_FILE but neither python3 nor jq is available to read it;"
+    echo "  -> falling back to the default roster below."
+    CONFIG_FILE=""
+  fi
+fi
+
+# Vertex uses Google Application Default Credentials, not an API key. Authenticate
+# before any tmux or worktree action, so a cancelled or failed browser login leaves
+# the repository untouched and every pane inherits the resulting credentials.
+if [ -n "$CONFIG_FILE" ]; then
+  if VERTEX_PROVIDER_CONFIG=$(vertex_provider_config "$CONFIG_FILE"); then
+    IFS=$'\x1f' read -r VERTEX_PROVIDER_ID VERTEX_PROJECT VERTEX_LOCATION \
+      <<<"$VERTEX_PROVIDER_CONFIG"
+    if ! command -v gcloud >/dev/null 2>&1; then
+      echo "Error: $CONFIG_FILE configures a Google Vertex provider, but 'gcloud' is not installed."
+      echo "Install the Google Cloud CLI, then run this command again."
+      exit 1
+    fi
+    if [ ! -t 0 ]; then
+      echo "Error: $CONFIG_FILE configures a Google Vertex provider and requires an interactive terminal."
+      echo "Run 'gcloud auth application-default login' in a terminal, then run work again."
+      exit 1
+    fi
+
+    echo "Google Vertex provider '$VERTEX_PROVIDER_ID' detected in: $CONFIG_FILE"
+    if [ -n "$VERTEX_PROJECT" ]; then
+      echo "  -> Using its configured Google Cloud project for ADC quota: $VERTEX_PROJECT"
+    else
+      echo "  -> No project is set in the provider; gcloud's existing ADC quota project will be used."
+    fi
+    if [ -n "$VERTEX_LOCATION" ]; then
+      echo "  -> Vertex location: $VERTEX_LOCATION"
+    fi
+    echo "Complete the Google sign-in prompted by gcloud before work continues."
+    if [ -n "$VERTEX_PROJECT" ]; then
+      GCLOUD_ADC_LOGIN=(gcloud auth application-default login "--project=$VERTEX_PROJECT")
+    else
+      GCLOUD_ADC_LOGIN=(gcloud auth application-default login)
+    fi
+    if ! "${GCLOUD_ADC_LOGIN[@]}"; then
+      echo "Error: Google Application Default Credentials login did not complete; no tmux session or worktrees were changed."
+      exit 1
+    fi
+  else
+    VERTEX_CONFIG_STATUS=$?
+    if [ "$VERTEX_CONFIG_STATUS" -eq 2 ]; then
+      echo "Warning: Could not parse $CONFIG_FILE to check for a Google Vertex provider."
+    fi
+  fi
+fi
 
 # If a tmux session already exists for this name, just attach to it.
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
@@ -384,22 +528,6 @@ AGENT_MODELS=()
 AGENT_PROMPTS=()
 AGENT_AUTO_APPROVE=()
 AGENT_WANTS_WORKTREE=()
-
-CONFIG_FILE=""
-for CANDIDATE in "${INVOCATION_DIR}/opencode.json" "${REPO_ROOT}/opencode.json"; do
-  if [ -f "$CANDIDATE" ]; then
-    CONFIG_FILE="$CANDIDATE"
-    break
-  fi
-done
-
-if [ -n "$CONFIG_FILE" ]; then
-  if ! command -v python3 >/dev/null 2>&1 && ! command -v jq >/dev/null 2>&1; then
-    echo "Found $CONFIG_FILE but neither python3 nor jq is available to read it;"
-    echo "  -> falling back to the default roster below."
-    CONFIG_FILE=""
-  fi
-fi
 
 # Registers one agent: validates the name, resolves its prompt file relative to
 # <prompt_base>, and appends it to the AGENT_* arrays. Both the opencode.json path

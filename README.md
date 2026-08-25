@@ -12,7 +12,9 @@ install -m 755 work ~/.local/bin/work
 ```
 
 **Requirements:** `bash`, `git`, `tmux`, and either `python3` or `jq` (only needed
-to read `opencode.json`). Agents themselves run `opencode`.
+to read `opencode.json`). Agents themselves run `opencode`. A project that
+configures the native Google Vertex provider also needs the Google Cloud CLI
+(`gcloud`) and an interactive terminal for Google sign-in.
 
 ---
 
@@ -81,9 +83,10 @@ Running `work squad` in `~/code/myrepo` with four configured agents gives you:
 - Pane 0 is focused when the session opens.
 
 Re-running `work` for a session that already has worktrees **reuses** them and
-ignores `num_worktrees`. If the tmux session is already alive, `work` just
-attaches — it does no provisioning in that case, so kill the session first if you
-want the symlinks and job files re-checked.
+ignores `num_worktrees`. If the tmux session is already alive, `work` runs any
+required Vertex sign-in preflight and then just attaches — it does no provisioning
+in that case, so kill the session first if you want the symlinks and job files
+re-checked.
 
 ---
 
@@ -205,6 +208,125 @@ Details:
 > same field. The tradeoff is that opencode itself gets no agent definitions from
 > this file.
 
+### Google Vertex AI
+
+When the selected project `opencode.json` configures Google Vertex through a
+native provider class, `work` runs `gcloud auth application-default login`
+**before** it creates/attaches a tmux session or creates/reuses worktrees. If the
+provider declares `options.project`, as in the example below, the script passes
+that value as `--project` so ADC quota and billing target the same Cloud project
+as the Vertex requests. Finish the browser sign-in and return to the terminal;
+cancelling or failing it leaves the repository and tmux unchanged.
+
+For the OpenCode v1-style config used by this script's examples, the provider
+looks like this (the provider ID, `vertex` here, is your choice):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "vertex": {
+      "npm": "@ai-sdk/google-vertex",
+      "name": "Google Vertex AI",
+      "options": {
+        "project": "my-gcp-project",
+        "location": "global"
+      }
+    }
+  },
+  "agents": {
+    "orchestrator": {
+      "model": "vertex/gemini-2.5-pro",
+      "worktree": false
+    }
+  }
+}
+```
+
+OpenCode v2 calls the corresponding fields `providers`, `package`, and
+`settings`; `work` recognizes both forms, including the native
+`@opencode-ai/ai/providers/google-vertex` package and its transport variants.
+It deliberately detects the provider **class**, not the provider ID, so a custom
+name such as `company-vertex` works too.
+
+Vertex also needs a Google Cloud project with the Vertex AI API enabled. Supply
+the project and optional location in the provider settings as above, or export
+`GOOGLE_VERTEX_PROJECT` and (optionally) `GOOGLE_VERTEX_LOCATION` in the shell
+profile used by tmux. `location: "global"` / `GOOGLE_VERTEX_LOCATION=global` is
+the AI SDK default; use a regional location when data residency requires one.
+
+---
+
+## How the panes authenticate
+
+For ordinary API-key providers, **`work` never touches credentials.** There is
+no key handling anywhere in the script — no environment variable is set, no
+config is written, and nothing is typed into a pane but the `opencode` command
+line itself. The one exception is a detected native Vertex provider: `work`
+starts the interactive `gcloud auth application-default login` preflight
+described above. Google writes the resulting Application Default Credentials;
+`work` does not read or write them.
+
+Every pane then authenticates as the same Unix user. OpenCode finds regular
+provider credentials from sources that are per-user and machine-wide rather than
+per-pane:
+
+| Source | Where | Written by |
+| --- | --- | --- |
+| Credential store | `~/.local/share/opencode/auth.json` (mode `0600`) | `opencode auth login` |
+| Environment | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, … | your shell profile |
+| Vertex ADC | Google Cloud's Application Default Credentials | `gcloud auth application-default login --project=<configured-project>` |
+
+Both are visible to every pane at once, which is the whole reason a squad needs
+no per-agent setup: pane 3 is the same Unix user on the same machine as pane 0,
+so it reads the same `auth.json` and inherits the same environment. Adding a
+fifth agent costs nothing in credential terms.
+
+### How the environment actually reaches a pane
+
+`work` starts each agent with `tmux send-keys`, which *types* the command into a
+pane that is already running a shell — it does not `exec opencode` directly. So
+the chain is:
+
+```
+tmux split-window  ->  login bash  ->  ~/.profile  ->  ~/.bashrc  ->  export *_API_KEY
+                                                                          |
+                       tmux send-keys "opencode --model … --prompt …" ----+--> opencode
+```
+
+tmux runs `default-shell` as a **login** shell (its `default-command` is empty),
+so each pane sources your profile from scratch before the sent command runs.
+That has a useful consequence: a key you add to `~/.bashrc` is picked up by the
+next pane you open, with no need to restart the tmux server.
+
+Confirm what any given pane will see:
+
+```bash
+opencode auth list    # prints stored credentials and detected env vars separately
+```
+
+### Caveats
+
+- **A key exported only in your current shell may not reach the panes.** The
+  tmux *server* captures its environment when it first starts, and refreshes
+  only the variables in `update-environment` (`DISPLAY`, `SSH_AUTH_SOCK` and
+  friends — no API keys) for later sessions. A key that lives in your profile is
+  fine, because the pane's login shell re-reads it. A one-off `export
+  FOO_API_KEY=…` before running `work` is not: kill the server (`tmux kill-server`)
+  or put it in the profile.
+- **Don't inline a key into the pane command.** Because agents are launched with
+  `send-keys`, anything you prepend lands in that pane's visible scrollback *and*
+  its shell history. Use `opencode auth login` or the profile instead.
+- **`work` cannot give two panes different credentials.** Model is per-agent
+  (`"model"` in `opencode.json`), identity is not. Every pane runs as you.
+- **Vertex sign-in is intentionally a launch preflight.** If the selected config
+  uses one of the recognized native Vertex classes, `work` asks gcloud to sign in
+  even if a tmux session of that name already exists. Use `work --clean` to tear
+  a session down without signing in; cleanup never launches an agent.
+- If a provider is configured in *both* `auth.json` and the environment,
+  resolving that is opencode's business, not `work`'s. Keep one to avoid
+  wondering which won.
+
 ---
 
 ## Shared job state
@@ -293,6 +415,10 @@ an older layout are still cleaned up. The shared `jobs/` directory is preserved.
   squad size.
 - **Model ids are not validated by `work`.** A bad id fails inside that pane at
   launch. Check against `opencode models` first.
+- **`work` only starts Vertex ADC sign-in.** If a Vertex pane still complains
+  about authentication, confirm its Cloud project, enabled Vertex AI API, and
+  selected model; for other providers, see
+  [How the panes authenticate](#how-the-panes-authenticate).
 - **`--auto` is genuinely dangerous.** opencode describes it as auto-approving
   every permission not explicitly denied. Fine for a sandboxed repo you can throw
   away; think twice anywhere else.
